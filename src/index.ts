@@ -320,17 +320,14 @@ async function handleWebhook(req: Request): Promise<Response> {
       text,
       attachments: origAttachments,
     };
-    // Only add Block Kit image blocks when every hosted URL is a public
-    // HTTPS URL. Otherwise Slack 400s the WHOLE message (invalid_blocks)
-    // and even the text never appears — exactly the "no msg posted" symptom.
+    // NOTE: image goes in attachments ONLY. Slack renders both attachments
+    // and Block Kit image blocks, so putting it in both = the image twice.
+    // (Attachments render on both Slack and Mattermost; image blocks are
+    // Slack-only.) Only add the text section block when it's safe: Slack
+    // 400s the WHOLE message (invalid_blocks) on some non-public URLs.
     if (hosted.every(isSlackRenderableUrl)) {
       (outgoing as any).blocks = [
         { type: "section", text: { type: "mrkdwn", text } },
-        ...hosted.map((url) => ({
-          type: "image",
-          image_url: url,
-          alt_text: fallback,
-        })),
       ];
     }
     for (const k of ["username", "icon_emoji", "icon_url", "channel"]) {
