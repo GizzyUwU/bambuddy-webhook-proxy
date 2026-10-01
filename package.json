@@ -1,0 +1,18 @@
+{
+  "name": "bambuddy-webhook-photo-unauth",
+  "version": "1.0.0",
+  "description": "Proxy: Bambuddy -> unauth image re-host -> Slack/Mattermost webhook",
+  "type": "module",
+  "scripts": {
+    "start": "bun src/index.ts",
+    "dev": "bun --hot src/index.ts"
+  },
+  "module": "src/index.ts",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

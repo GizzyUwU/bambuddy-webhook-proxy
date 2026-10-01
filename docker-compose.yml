@@ -1,0 +1,22 @@
+services:
+  bambuddy-proxy:
+    build: .
+    container_name: bambuddy-webhook-proxy
+    restart: unless-stopped
+    ports:
+      - "43060:3000"
+    environment:
+      - PORT=3000
+      # Where to forward rewritten payloads (Slack / Mattermost incoming webhook).
+      # Comma-separated list = fan-out to several.
+      - REAL_WEBHOOK_URL=${REAL_WEBHOOK_URL}
+      # Public URL of THIS proxy, so Slack's cloud can fetch /img/:id.
+      # Example: https://bambuddy-proxy.example.com (no trailing slash).
+      # If unset, falls back to the incoming Host header.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - IMAGE_TTL_HOURS=${IMAGE_TTL_HOURS:-72}
+      - MAX_IMAGE_BYTES=${MAX_IMAGE_BYTES:-10000000}
+      # Optional: sent as X-API-Key when downloading Bambuddy image_urls.
+      - BAMBUDDY_API_KEY=${BAMBUDDY_API_KEY:-}
+      # Optional: require ?token= or Bearer on incoming POSTs.
+      - INCOMING_TOKEN=${INCOMING_TOKEN:-}
