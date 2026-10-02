@@ -333,6 +333,18 @@ async function handleWebhook(req: Request): Promise<Response> {
     attempted++;
     const dl = await downloadImage(u, req);
     if (dl) {
+      // Bambuddy generic format can carry the SAME photo twice (base64
+      // `image` + URL). Skip byte-identical downloads so we don't attach
+      // the same image twice.
+      const dup = toHost.some(
+        (e) =>
+          e.bytes.length === dl.bytes.length &&
+          Buffer.from(e.bytes).equals(Buffer.from(dl.bytes)),
+      );
+      if (dup) {
+        console.log(`[img] ${u} is a duplicate of an already-collected image — skipping`);
+        continue;
+      }
       toHost.push(dl);
       downloadedFrom.push(u);
     }
@@ -352,18 +364,18 @@ async function handleWebhook(req: Request): Promise<Response> {
     images.set(id, { ...img, createdAt: Date.now() });
     hosted.push(`${base}/img/${id}.${extFor(img.contentType)}`);
   }
-  // original URL -> hosted URL, used to swap the private Bambuddy link
-  // out of the forwarded text so Slack never shows the unreachable URL.
-  // toHost[0..nBase64) are base64 (no source URL); downloads follow in order.
-  const nBase64 = toHost.length - downloadedCount;
-  const replacements: [string, string][] = downloadedFrom
-    .map((from, j): [string, string] => [from, hosted[nBase64 + j] ?? ""])
-    .filter(([_, to]) => Boolean(to));
-  // Swap private Bambuddy URLs for our public re-hosts in the text, so
-  // the channel sees one working link/image instead of a dead private URL.
-  for (const [from, to] of replacements) {
-    text = text.split(from).join(to);
+  // Strip the now-proxied private URLs out of the text entirely. The image
+  // itself travels in attachments[].image_url — leaving a *fetchable* image
+  // URL in the text makes Slack unfurl a SECOND copy of the image (text
+  // preview + attachment). Removing keeps exactly one image.
+  for (const from of downloadedFrom) {
+    text = text.split(from).join("");
   }
+  text = text
+    .replace(/[ \t]+(\n|$)/gm, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
+  if (!text) text = title || message || "Bambuddy notification";
 
   // --- build outgoing Slack/Mattermost-compatible payload ---
   const fallback = title || text.slice(0, 120);
@@ -384,13 +396,13 @@ async function handleWebhook(req: Request): Promise<Response> {
       }
     }
     // Scrub any leftover private Bambuddy URLs from attachment
-    // fallback/text so only the public re-host is ever shown.
+    // fallback/text for the same reason (avoid a second unfurled copy).
     for (const a of origAttachments) {
       if (a && typeof a === "object") {
         for (const fk of ["fallback", "text", "title"]) {
           if (typeof (a as any)[fk] === "string") {
-            for (const [from, to] of replacements) {
-              (a as any)[fk] = (a as any)[fk].split(from).join(to);
+            for (const from of downloadedFrom) {
+              (a as any)[fk] = (a as any)[fk].split(from).join("");
             }
           }
         }
@@ -399,7 +411,8 @@ async function handleWebhook(req: Request): Promise<Response> {
     while (hi < hosted.length) {
       let amsg = message || undefined;
       if (typeof amsg === "string") {
-        for (const [from, to] of replacements) amsg = amsg.split(from).join(to) as string;
+        for (const from of downloadedFrom) amsg = amsg.split(from).join("") as string;
+        amsg = amsg.replace(/[ \t]+(\n|$)/gm, "$1").trimEnd() || undefined;
       }
       origAttachments.push({
         fallback,
