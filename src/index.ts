@@ -136,7 +136,46 @@ function isSlackRenderableUrl(url: string): boolean {
   }
 }
 
+function cleanUrl(raw: string): string {
+  // Slack mrkdwn `<https://..|label>` leaves `|label` attached to the match,
+  // and bold wrapping (`*url*`) or sentence punctuation (`.`, `,`, `!`)
+  // gets glued to the end. Strip all of that.
+  let u = raw;
+  const pipe = u.indexOf("|");
+  if (pipe !== -1) u = u.slice(0, pipe);
+  u = u.replace(/[*,.!?;:_\]~]+$/g, "");
+  return u;
+}
+
+function isImageCandidate(url: string): boolean {
+  try {
+    const u = new URL(url);
+    const path = u.pathname;
+    // Normal case: URL path ends with an image extension. Use pathname
+    // (not the raw string) so query strings / fragments don't break it.
+    if (/\.(jpe?g|png|gif|webp)$/i.test(path)) return true;
+    // Bambuddy photo URLs: /api/v1/archives/<id>/photos/<file>
+    // (usually .jpg, but accept regardless of extension — the download
+    // verifies content-type anyway).
+    if (/\/api\/v\d+\/archives\//i.test(path)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function collectImageUrls(node: unknown, out: string[]): void {
+  // Scan EVERY string in the payload (text, message, fallback, blocks,
+  // etc.) — Bambuddy puts the photo URL in different fields depending on
+  // format/event, and only scanning `text` misses most of them.
+  if (typeof node === "string") {
+    const re = /https?:\/\/[^\s<>"')\]]+/g;
+    for (const m of node.matchAll(re)) {
+      const cleaned = cleanUrl(m[0]);
+      if (cleaned.startsWith("http") && isImageCandidate(cleaned)) out.push(cleaned);
+    }
+    return;
+  }
   if (!node || typeof node !== "object") return;
   if (Array.isArray(node)) {
     for (const v of node) collectImageUrls(v, out);
@@ -145,15 +184,11 @@ function collectImageUrls(node: unknown, out: string[]): void {
   const obj = node as Record<string, unknown>;
   for (const [k, v] of Object.entries(obj)) {
     if ((k === "image_url" || k === "imageUrl") && typeof v === "string" && v.startsWith("http")) {
-      out.push(v);
-    } else if (typeof v === "object") {
+      // Explicit image fields: trust them even without an extension
+      // (Bambuddy photo routes); download verifies it's really an image.
+      out.push(cleanUrl(v));
+    } else {
       collectImageUrls(v, out);
-    } else if (k === "text" && typeof v === "string") {
-      // also catch markdown <http://...|...> and bare http image links
-      const re = /https?:\/\/[^\s<>"')]+/g;
-      for (const m of v.matchAll(re)) {
-        if (/\.(jpe?g|png|gif|webp)(\?\S*)?$/i.test(m[0])) out.push(m[0]);
-      }
     }
   }
 }
@@ -162,46 +197,64 @@ async function downloadImage(
   url: string,
   incoming: Request,
 ): Promise<{ bytes: Uint8Array; contentType: string } | null> {
-  try {
-    const headers: Record<string, string> = { "User-Agent": "bambuddy-proxy/1.0" };
-    // Auth for Bambuddy's protected photo URLs
-    // (/api/v1/archives/.../photos/....jpg requires an API key).
-    // Priority: configured key first, else whatever the caller sent us.
-    // Bambuddy accepts the key as X-API-Key OR Authorization: Bearer —
-    // send both forms so either gate passes.
-    const auth = incoming.headers.get("authorization");
-    const apiKey = incoming.headers.get("x-api-key");
-    const key = BAMBUDDY_API_KEY || apiKey || (auth?.startsWith("Bearer ") ? auth.slice(7) : "");
-    if (key) {
-      headers["X-API-Key"] = key;
-      headers["Authorization"] = `Bearer ${key}`;
-    } else if (auth) {
-      headers["Authorization"] = auth;
-    }
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 15_000);
-    const res = await fetch(url, { headers, signal: ctrl.signal });
-    clearTimeout(t);
-    if (!res.ok) {
+  // Bambuddy sometimes fires the webhook before the photo file is
+  // actually readable (or while the archive is still being written),
+  // so a single fetch flakes. Retry 404/5xx/network errors a few times;
+  // don't bother retrying 401/403 (bad key won't fix itself in 10s).
+  const MAX_ATTEMPTS = 4;
+  const DELAYS_MS = [1500, 3000, 5000];
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const headers: Record<string, string> = { "User-Agent": "bambuddy-proxy/1.0" };
+      // Auth for Bambuddy's protected photo URLs
+      // (/api/v1/archives/.../photos/....jpg requires an API key).
+      // Priority: configured key first, else whatever the caller sent us.
+      // Bambuddy accepts the key as X-API-Key OR Authorization: Bearer —
+      // send both forms so either gate passes.
+      const auth = incoming.headers.get("authorization");
+      const apiKey = incoming.headers.get("x-api-key");
+      const key = BAMBUDDY_API_KEY || apiKey || (auth?.startsWith("Bearer ") ? auth.slice(7) : "");
+      if (key) {
+        headers["X-API-Key"] = key;
+        headers["Authorization"] = `Bearer ${key}`;
+      } else if (auth) {
+        headers["Authorization"] = auth;
+      }
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 15_000);
+      const res = await fetch(url, { headers, signal: ctrl.signal });
+      clearTimeout(t);
+      if (res.ok) {
+        const ct = res.headers.get("content-type") ?? "image/jpeg";
+        const buf = new Uint8Array(await res.arrayBuffer());
+        if (buf.length === 0 || buf.length > MAX_IMAGE_BYTES) return null;
+        // Only accept actual images — a 200 with JSON/HTML (e.g. an API
+        // error page) must not be re-hosted as an "image".
+        if (!ct.split(";")[0].trim().toLowerCase().startsWith("image/")) {
+          console.error(`[img] ${url} returned content-type ${ct} (not an image) — forwarding text-only.`);
+          return null;
+        }
+        if (attempt > 1) console.log(`[img] fetched ${url} on attempt ${attempt}`);
+        return { bytes: buf, contentType: ct.split(";")[0] };
+      }
       if (res.status === 401 || res.status === 403) {
         console.error(
           `[img] fetch ${res.status} for ${url} — Bambuddy rejected the API key ` +
             `(missing key? set BAMBUDDY_API_KEY to a key with Read Status scope). ` +
             `Forwarding text-only.`,
         );
-      } else {
-        console.error(`[img] fetch ${res.status} for ${url} — forwarding text-only.`);
+        return null;
       }
-      return null;
+      const body = (await res.text().catch(() => "")).slice(0, 200);
+      console.error(`[img] fetch ${res.status} for ${url} (attempt ${attempt}/${MAX_ATTEMPTS}) ${body}`);
+      if (attempt === MAX_ATTEMPTS) return null;
+    } catch (e) {
+      console.error(`[img] fetch failed for ${url} (attempt ${attempt}/${MAX_ATTEMPTS}):`, (e as Error).message);
+      if (attempt === MAX_ATTEMPTS) return null;
     }
-    const ct = res.headers.get("content-type") ?? "image/jpeg";
-    const buf = new Uint8Array(await res.arrayBuffer());
-    if (buf.length === 0 || buf.length > MAX_IMAGE_BYTES) return null;
-    return { bytes: buf, contentType: ct.split(";")[0] };
-  } catch (e) {
-    console.error(`[img] fetch failed for ${url}:`, (e as Error).message);
-    return null;
+    await Bun.sleep(DELAYS_MS[Math.min(attempt - 1, DELAYS_MS.length - 1)]);
   }
+  return null;
 }
 
 function checkIncomingAuth(req: Request): boolean {
@@ -263,23 +316,33 @@ async function handleWebhook(req: Request): Promise<Response> {
   //    Bambuddy photo URLs look like
   //    https://<host>/api/v1/archives/21/photos/finish_....jpg and REQUIRE
   //    an API key (X-API-Key / Bearer) — Slack can't send one, we can.
+  //    URLs are also picked up from ANY text field (text/message/fallback/
+  //    blocks) so a bare photo link in the message still gets proxied.
   const urls: string[] = [];
   collectImageUrls(payload, urls);
+  console.log(`[img] collected candidate URLs: ${JSON.stringify(urls)}`);
   const seen = new Set<string>();
+  const downloadedFrom: string[] = [];
   let attempted = 0;
-  for (const u of urls.slice(0, 3)) {
+  for (const u of urls) {
+    if (toHost.length >= 3) break;
     if (seen.has(u)) continue;
     seen.add(u);
     // skip if it already points at us (loop guard).
     if (u.startsWith(publicBase(req) + "/img/")) continue;
     attempted++;
     const dl = await downloadImage(u, req);
-    if (dl) toHost.push(dl);
+    if (dl) {
+      toHost.push(dl);
+      downloadedFrom.push(u);
+    }
   }
+  const downloadedCount = downloadedFrom.length;
   const imageWarning =
-    attempted > toHost.length
-      ? "image download failed (likely missing/invalid BAMBUDDY_API_KEY) — forwarded text-only"
+    attempted > downloadedCount
+      ? "image download failed (Bambuddy photo not ready yet or missing/invalid BAMBUDDY_API_KEY) — forwarded text-only"
       : undefined;
+  if (imageWarning) console.error(`[img] ${imageWarning} candidates=${JSON.stringify(urls)}`);
 
   // --- store + build public URLs ---
   const base = publicBase(req);
@@ -288,6 +351,18 @@ async function handleWebhook(req: Request): Promise<Response> {
     const id = newId();
     images.set(id, { ...img, createdAt: Date.now() });
     hosted.push(`${base}/img/${id}.${extFor(img.contentType)}`);
+  }
+  // original URL -> hosted URL, used to swap the private Bambuddy link
+  // out of the forwarded text so Slack never shows the unreachable URL.
+  // toHost[0..nBase64) are base64 (no source URL); downloads follow in order.
+  const nBase64 = toHost.length - downloadedCount;
+  const replacements: [string, string][] = downloadedFrom
+    .map((from, j): [string, string] => [from, hosted[nBase64 + j] ?? ""])
+    .filter(([_, to]) => Boolean(to));
+  // Swap private Bambuddy URLs for our public re-hosts in the text, so
+  // the channel sees one working link/image instead of a dead private URL.
+  for (const [from, to] of replacements) {
+    text = text.split(from).join(to);
   }
 
   // --- build outgoing Slack/Mattermost-compatible payload ---
@@ -308,11 +383,28 @@ async function handleWebhook(req: Request): Promise<Response> {
         }
       }
     }
+    // Scrub any leftover private Bambuddy URLs from attachment
+    // fallback/text so only the public re-host is ever shown.
+    for (const a of origAttachments) {
+      if (a && typeof a === "object") {
+        for (const fk of ["fallback", "text", "title"]) {
+          if (typeof (a as any)[fk] === "string") {
+            for (const [from, to] of replacements) {
+              (a as any)[fk] = (a as any)[fk].split(from).join(to);
+            }
+          }
+        }
+      }
+    }
     while (hi < hosted.length) {
+      let amsg = message || undefined;
+      if (typeof amsg === "string") {
+        for (const [from, to] of replacements) amsg = amsg.split(from).join(to) as string;
+      }
       origAttachments.push({
         fallback,
         title: title || undefined,
-        text: message || undefined,
+        text: amsg,
         image_url: hosted[hi++],
       });
     }
